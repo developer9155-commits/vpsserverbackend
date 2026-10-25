@@ -21,6 +21,8 @@ services:
         value: "22"
       - key: VPS_USER
         value: techbooster
+      - key: VPS_PASSWORD
+        sync: false
       - key: VPS_SSH_KEY_B64      # base64 -w0 of the PRIVATE key
         sync: false
       - key: VPS_SSH_KEY_PASSPHRASE

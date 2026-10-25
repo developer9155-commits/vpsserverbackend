@@ -148,7 +148,7 @@ def env_params():
 def load_key():
     b64 = os.environ.get("VPS_SSH_KEY_B64", "").strip()
     if not b64:
-        raise VPSError("VPS_SSH_KEY_B64 is not set on the backend (base64 of your private key).")
+        return None
     try:
         pem = base64.b64decode(b64).decode()
     except Exception:
@@ -164,7 +164,10 @@ def load_key():
 
 def open_transport(host, port, username):
     pinned = [p.strip() for p in os.environ.get("VPS_HOST_FINGERPRINT", "").split(",") if p.strip()]
-    key = load_key()
+    password = os.environ.get("VPS_PASSWORD")
+    key = None if password else load_key()
+    if not password and key is None:
+        raise VPSError("Set VPS_PASSWORD or VPS_SSH_KEY_B64 on the backend to enable SSH authentication.")
     try:
         sock = socket.create_connection((host, port), timeout=10)
     except OSError as e:
@@ -181,7 +184,10 @@ def open_transport(host, port, username):
             )
         if not any(hmac.compare_digest(fp, p) for p in pinned):
             raise VPSError(f"HOST KEY MISMATCH: server presented {fp}. Connection refused (possible MITM).")
-        t.auth_publickey(username, key)
+        if password:
+            t.auth_password(username, password)
+        else:
+            t.auth_publickey(username, key)
         t.set_keepalive(30)
         return t, fp
     except VPSError:
@@ -189,7 +195,8 @@ def open_transport(host, port, username):
         raise
     except paramiko.AuthenticationException:
         t.close()
-        raise VPSError(f"SSH key rejected for user '{username}'. Add the public key to ~/.ssh/authorized_keys.")
+        method = "password" if password else "SSH key"
+        raise VPSError(f"SSH {method} authentication rejected for user '{username}'. Check the backend credentials and VPS SSH settings.")
     except Exception as e:
         t.close()
         raise VPSError(f"SSH error: {e}")
@@ -340,7 +347,7 @@ def vps_info(alive):
         "fingerprint": vps.fp if alive else None,
         "connected_at": vps.connected_at if alive else None,
         "linger": vps.linger if alive else None,
-        "key_configured": bool(os.environ.get("VPS_SSH_KEY_B64")),
+        "auth_configured": bool(os.environ.get("VPS_PASSWORD") or os.environ.get("VPS_SSH_KEY_B64")),
         "fingerprint_pinned": bool(os.environ.get("VPS_HOST_FINGERPRINT")),
         "last_error": vps.last_error,
     }
@@ -361,7 +368,7 @@ def vps_status():
 
 @app.post("/api/vps/connect", dependencies=[Depends(auth), Depends(limit("connect", 10))], tags=["vps"])
 def vps_connect(body: ConnectBody = ConnectBody()):
-    """Open the SSH connection. Auth key comes from backend env; the host key must match the pinned fingerprint."""
+    """Open SSH using backend password or key credentials; the host key must match the pinned fingerprint."""
     p = dict(env_params() or {"host": None, "port": 22, "username": "techbooster"})
     p.update({k: v for k, v in body.model_dump().items() if v is not None})
     if not p.get("host"):
