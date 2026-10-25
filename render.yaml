@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: techbooster-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    # ONE worker on purpose: the SSH connection and rate limiter live in memory.
+    startCommand: gunicorn main:app -k uvicorn.workers.UvicornWorker -w 1 --timeout 180 -b 0.0.0.0:$PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
+      - key: API_TOKEN            # generate: python -c "import secrets;print(secrets.token_urlsafe(40))"
+        sync: false
+      - key: FRONTEND_ORIGINS     # e.g. https://your-app.vercel.app
+        sync: false
+      - key: VPS_HOST
+        sync: false
+      - key: VPS_PORT
+        value: "22"
+      - key: VPS_USER
+        value: techbooster
+      - key: VPS_SSH_KEY_B64      # base64 -w0 of the PRIVATE key
+        sync: false
+      - key: VPS_SSH_KEY_PASSPHRASE
+        sync: false
+      - key: VPS_HOST_FINGERPRINT # SHA256:xxxx (comma-separate several)
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "25"
+      - key: ENABLE_DOCS
+        value: "true"
