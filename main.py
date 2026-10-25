@@ -1,7 +1,7 @@
 """TechBooster VPS Bot Manager - FastAPI backend.
 
-Runs on Render. It never runs bots itself: it talks to YOUR VPS over a
-host-key-pinned SSH connection and manages bots as systemd *user* services.
+Runs on Render. It never runs bots itself: it talks to a VPS (entered by the user) over an
+SSH connection and manages bots as systemd *user* services.
 All state (projects, venvs, logs) lives on the VPS, so Render restarts or
 free-tier sleep lose nothing; the SSH link is re-opened lazily on demand.
 """
@@ -9,6 +9,7 @@ import base64
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -135,42 +136,64 @@ WantedBy=default.target
 
 
 def env_params():
+    """Optional fallback VPS from backend env vars (users can instead send their own via /api/vps/connect)."""
     host = os.environ.get("VPS_HOST", "").strip()
     if not host:
         return None
     return {
         "host": host,
         "port": int(os.environ.get("VPS_PORT", "22") or 22),
-        "username": os.environ.get("VPS_USER", "techbooster").strip(),
+        "username": os.environ.get("VPS_USER", "root").strip(),
+        "password": os.environ.get("VPS_PASSWORD") or None,
+        "key_pem": None,
+        "key_pass": None,
+        "fingerprint": None,
     }
 
 
-def load_key():
-    b64 = os.environ.get("VPS_SSH_KEY_B64", "").strip()
-    if not b64:
-        return None
-    try:
-        pem = base64.b64decode(b64).decode()
-    except Exception:
-        raise VPSError("VPS_SSH_KEY_B64 is not valid base64. Use: base64 -w0 keyfile")
-    pw = os.environ.get("VPS_SSH_KEY_PASSPHRASE") or None
+def load_key(pem=None, pw=None):
+    if not pem:
+        b64 = os.environ.get("VPS_SSH_KEY_B64", "").strip()
+        if not b64:
+            return None
+        try:
+            pem = base64.b64decode(b64).decode()
+        except Exception:
+            raise VPSError("VPS_SSH_KEY_B64 is not valid base64. Use: base64 -w0 keyfile")
+        pw = os.environ.get("VPS_SSH_KEY_PASSPHRASE") or None
     for cls in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
         try:
-            return cls.from_private_key(io.StringIO(pem), password=pw)
+            return cls.from_private_key(io.StringIO(pem), password=pw or None)
         except paramiko.SSHException:
             continue
     raise VPSError("Could not read the SSH private key (ed25519, RSA or ECDSA, correct passphrase).")
 
 
+def check_host_allowed(host):
+    """Block loopback / private / link-local targets so the API can't be used to probe internal networks."""
+    if os.environ.get("ALLOW_PRIVATE_HOSTS", "false").lower() == "true":
+        return
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        raise VPSError(f"Cannot resolve host '{host}'.")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            raise VPSError("That host address is not allowed (private or local network).")
+
+
 _seen_fp = {}  # trust-on-first-use memory (per host:port, lives until Render restarts)
 
 
-def open_transport(host, port, username):
-    pinned = [p.strip() for p in os.environ.get("VPS_HOST_FINGERPRINT", "").split(",") if p.strip()]
-    password = os.environ.get("VPS_PASSWORD")
-    key = None if password else load_key()
+def open_transport(p):
+    host, port, username = p["host"], p["port"], p["username"]
+    pinned = [x.strip() for x in (p.get("fingerprint") or os.environ.get("VPS_HOST_FINGERPRINT", "")).split(",") if x.strip()]
+    password = p.get("password")
+    key = None if password else load_key(p.get("key_pem"), p.get("key_pass"))
     if not password and key is None:
-        raise VPSError("Set VPS_PASSWORD (password login) or VPS_SSH_KEY_B64 (key login) in the backend environment.")
+        raise VPSError("No SSH credentials. Send a password or private key with the connect request.")
+    check_host_allowed(host)
     try:
         sock = socket.create_connection((host, port), timeout=10)
     except OSError as e:
@@ -211,7 +234,7 @@ def open_transport(host, port, username):
     except paramiko.AuthenticationException:
         t.close()
         method = "password" if password else "SSH key"
-        raise VPSError(f"SSH {method} authentication rejected for user '{username}'. Check VPS_USER / VPS_PASSWORD and that the VPS allows password login (PasswordAuthentication yes).")
+        raise VPSError(f"SSH {method} authentication rejected for user '{username}'. Check the username/password and that the VPS allows password login (PasswordAuthentication yes).")
     except Exception as e:
         t.close()
         raise VPSError(f"SSH error: {e}")
@@ -226,7 +249,7 @@ def do_connect(p):
                 pass
             vps.t = None
         try:
-            t, fp = open_transport(p["host"], p["port"], p["username"])
+            t, fp = open_transport(p)
         except VPSError as e:
             vps.last_error = str(e)
             raise
@@ -349,7 +372,12 @@ def health():
 class ConnectBody(BaseModel):
     host: Optional[str] = Field(None, max_length=253, pattern=r"^[A-Za-z0-9.:\-]+$")
     port: Optional[int] = Field(None, ge=1, le=65535)
-    username: Optional[str] = Field(None, pattern=r"^[a-z_][a-z0-9_-]{0,31}$")
+    username: Optional[str] = Field(None, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+    password: Optional[str] = Field(None, max_length=256, repr=False)
+    private_key: Optional[str] = Field(None, max_length=20000, repr=False, description="PEM text, alternative to password")
+    key_passphrase: Optional[str] = Field(None, max_length=256, repr=False)
+    fingerprint: Optional[str] = Field(None, max_length=600, pattern=r"^[A-Za-z0-9:+/=,\s]+$",
+                                       description="Optional SHA256:... host key fingerprint to enforce")
 
 
 def vps_info(alive):
@@ -362,10 +390,10 @@ def vps_info(alive):
         "fingerprint": vps.fp if alive else None,
         "connected_at": vps.connected_at if alive else None,
         "linger": vps.linger if alive else None,
-        "auth_configured": bool(os.environ.get("VPS_PASSWORD") or os.environ.get("VPS_SSH_KEY_B64")),
-        "fingerprint_pinned": bool(os.environ.get("VPS_HOST_FINGERPRINT")),  # false = trust-on-first-use
+        "auth_configured": bool(p.get("password") or p.get("key_pem") or os.environ.get("VPS_SSH_KEY_B64")),
+        "fingerprint_pinned": bool(p.get("fingerprint") or os.environ.get("VPS_HOST_FINGERPRINT")),  # false = trust-on-first-use
         "last_error": vps.last_error,
-    }
+    }  # secrets are never returned
 
 
 @app.get("/api/vps/status", dependencies=[Depends(auth)], tags=["vps"])
@@ -383,17 +411,35 @@ def vps_status():
 
 @app.post("/api/vps/connect", dependencies=[Depends(auth), Depends(limit("connect", 10))], tags=["vps"])
 def vps_connect(body: ConnectBody = ConnectBody()):
-    """Open SSH using backend password or key credentials; the host key must match the pinned fingerprint."""
-    p = dict(env_params() or {"host": None, "port": 22, "username": "techbooster"})
-    p.update({k: v for k, v in body.model_dump().items() if v is not None})
+    """Connect to a VPS. Send host, port, username and password (or private_key) in the body.
+    Credentials are kept in backend memory only (never stored on disk, never returned); after a
+    Render restart/sleep, connect again. An empty body uses the optional VPS_* env fallback."""
+    base = env_params()
+    p = dict(base or {"host": None, "port": 22, "username": "root", "password": None,
+                      "key_pem": None, "key_pass": None, "fingerprint": None})
+    has_creds = bool(body.password or body.private_key)
+    if body.host and not has_creds and (not base or body.host != base["host"]):
+        raise HTTPException(422, "Send a password or private_key together with the host.")
+    for k in ("host", "port", "username"):
+        v = getattr(body, k)
+        if v is not None:
+            p[k] = v
+    if body.password:
+        p.update(password=body.password, key_pem=None, key_pass=None)
+    elif body.private_key:
+        p.update(password=None, key_pem=body.private_key, key_pass=body.key_passphrase)
+    if body.fingerprint:
+        p["fingerprint"] = body.fingerprint
     if not p.get("host"):
         raise HTTPException(422, "VPS host is required.")
+    _seen_fp.pop((p["host"], p["port"]), None)  # explicit connect: re-learn host key (shown in response to verify)
     do_connect(p)
     return vps_info(True)
 
 
 @app.post("/api/vps/disconnect", dependencies=[Depends(auth)], tags=["vps"])
 def vps_disconnect():
+    """Close SSH and forget the credentials held in memory."""
     with vps.lock:
         vps.manual_off = True
         if vps.t is not None:
@@ -402,6 +448,8 @@ def vps_disconnect():
             except Exception:
                 pass
         vps.t = None
+        vps.params = None
+        vps.fp = None
     return vps_info(False)
 
 
