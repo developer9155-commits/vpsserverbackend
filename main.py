@@ -344,6 +344,8 @@ async def size_guard(request: Request, call_next):
 app.add_middleware(  # added last => outermost, so CORS headers also cover errors
     CORSMiddleware,
     allow_origins=ORIGINS,
+    # Local testing: any http://localhost:PORT or http://127.0.0.1:PORT page. Set ALLOW_LOCALHOST=false in production.
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$" if os.environ.get("ALLOW_LOCALHOST", "true").lower() == "true" else None,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
     max_age=600,
